@@ -1,35 +1,57 @@
 import React, { useState } from 'react';
 import { Difficulty, PlayerRole } from '../types/game';
-import { Bomb, BookOpen, Users, User, Shield, Volume2, Sparkles, Copy, Check } from 'lucide-react';
+import { Bomb, BookOpen, Users, User, Sparkles, Copy, Check, Globe, KeyRound, RotateCcw } from 'lucide-react';
 import { soundManager } from '../utils/audio';
 
 interface LobbyViewProps {
   onStartSolo: (diff: Difficulty) => void;
-  onJoinRoom: (roomId: string, role: PlayerRole, diff: Difficulty) => void;
+  onJoinRoom: (roomId: string, role: PlayerRole, diff: Difficulty, serverHost: string) => void;
   initialRoomId?: string;
   initialRole?: PlayerRole;
+  initialServerHost?: string;
 }
 
 export const LobbyView: React.FC<LobbyViewProps> = ({
   onStartSolo,
   onJoinRoom,
   initialRoomId = '',
-  initialRole = 'defuser'
+  initialRole = 'defuser',
+  initialServerHost = ''
 }) => {
-  const [mode, setMode] = useState<'solo' | 'multi'>('solo');
+  const [mode, setMode] = useState<'solo' | 'multi'>('multi');
   const [difficulty, setDifficulty] = useState<Difficulty>('normal');
+  const [serverHost, setServerHost] = useState(
+    initialServerHost || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000')
+  );
   const [roomId, setRoomId] = useState(
     initialRoomId || `ROOM-${Math.floor(1000 + Math.random() * 9000)}`
   );
   const [selectedRole, setSelectedRole] = useState<PlayerRole>(initialRole);
   const [copied, setCopied] = useState(false);
 
+  const cleanHost = serverHost.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+
   const handleCopyLink = () => {
     const oppRole = selectedRole === 'defuser' ? 'manual' : 'defuser';
-    const url = `${window.location.origin}${window.location.pathname}?room=${roomId}&role=${oppRole}`;
+    const isCurrentHost = typeof window !== 'undefined' && (cleanHost === window.location.host || !cleanHost);
+    let url: string;
+    if (isCurrentHost) {
+      url = `${window.location.origin}/?room=${encodeURIComponent(roomId)}&role=${oppRole}`;
+    } else {
+      const protocol = typeof window !== 'undefined' ? window.location.protocol : 'http:';
+      url = `${protocol}//${cleanHost}/?room=${encodeURIComponent(roomId)}&role=${oppRole}&server=${encodeURIComponent(cleanHost)}`;
+    }
     navigator.clipboard.writeText(url);
     setCopied(true);
     setTimeout(() => setCopied(false), 2500);
+  };
+
+  const handleResetHost = () => {
+    setServerHost(window.location.host);
+  };
+
+  const handleRegenRoom = () => {
+    setRoomId(`ROOM-${Math.floor(1000 + Math.random() * 9000)}`);
   };
 
   const handleStart = () => {
@@ -37,7 +59,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
     if (mode === 'solo') {
       onStartSolo(difficulty);
     } else {
-      onJoinRoom(roomId, selectedRole, difficulty);
+      onJoinRoom(roomId, selectedRole, difficulty, cleanHost);
     }
   };
 
@@ -57,12 +79,38 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
         </p>
       </div>
 
+      {/* Invite Notice */}
+      {initialRoomId && (
+        <div className="bg-amber-950/50 border border-amber-500/60 rounded-xl p-3 flex items-center gap-2.5 text-xs font-mono text-amber-200 animate-in fade-in">
+          <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
+          <span>
+            招待を検知しました！ ルーム: <strong className="text-white underline">{initialRoomId}</strong> / 役割: <strong className="text-white">{selectedRole === 'manual' ? '📋 分析班' : '💣 解除班'}</strong><br />
+            設定を確認の上、下の「任務開始」を押して合流してください。
+          </span>
+        </div>
+      )}
+
       {/* Mode Selector */}
       <div className="space-y-2">
         <label className="text-xs font-mono font-bold text-gray-400 uppercase tracking-wider block">
           プレイモード選択
         </label>
         <div className="grid grid-cols-2 gap-3">
+          <button
+            onClick={() => setMode('multi')}
+            className={`p-4 rounded-xl border-2 flex flex-col items-center gap-2 transition-all ${
+              mode === 'multi'
+                ? 'bg-[#222736] border-red-500 shadow-[0_0_15px_rgba(239,68,68,0.25)]'
+                : 'bg-[#151720] border-[#2e3344] text-gray-400 hover:border-gray-500'
+            }`}
+          >
+            <Users size={24} className={mode === 'multi' ? 'text-red-400' : ''} />
+            <span className="font-bold font-mono text-sm text-white">2人通信・協力プレイ</span>
+            <span className="text-[11px] text-gray-400 text-center">
+              IPv4アドレスや部屋コードで接続し役割を分担
+            </span>
+          </button>
+
           <button
             onClick={() => setMode('solo')}
             className={`p-4 rounded-xl border-2 flex flex-col items-center gap-2 transition-all ${
@@ -77,27 +125,13 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
               爆弾とマニュアルを自由に切替または同時表示
             </span>
           </button>
-
-          <button
-            onClick={() => setMode('multi')}
-            className={`p-4 rounded-xl border-2 flex flex-col items-center gap-2 transition-all ${
-              mode === 'multi'
-                ? 'bg-[#222736] border-red-500 shadow-[0_0_15px_rgba(239,68,68,0.25)]'
-                : 'bg-[#151720] border-[#2e3344] text-gray-400 hover:border-gray-500'
-            }`}
-          >
-            <Users size={24} className={mode === 'multi' ? 'text-red-400' : ''} />
-            <span className="font-bold font-mono text-sm text-white">2人協力プレイ</span>
-            <span className="text-[11px] text-gray-400 text-center">
-              別端末や別タブで「解除班」と「指示書」を分担
-            </span>
-          </button>
         </div>
       </div>
 
-      {/* Multiplayer Role & Room settings */}
+      {/* Multiplayer Connection & Role Settings */}
       {mode === 'multi' && (
         <div className="bg-[#13151c] border border-[#2b3042] rounded-xl p-4 space-y-4 animate-in fade-in">
+          {/* Role Selection */}
           <div>
             <label className="text-xs font-mono font-bold text-gray-400 block mb-1">
               あなたの担当役割
@@ -129,26 +163,70 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
             </div>
           </div>
 
-          <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-mono font-bold text-gray-400">
-              ルームID
-            </label>
+          {/* IPv4 Address / Host Input */}
+          <div className="flex flex-col gap-1.5 border-t border-[#252a3b] pt-3">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-mono font-bold text-gray-300 flex items-center gap-1.5">
+                <Globe size={14} className="text-blue-400" />
+                <span>接続先サーバー (IPv4 アドレス または ホスト名)</span>
+              </label>
+              <button
+                type="button"
+                onClick={handleResetHost}
+                className="text-[10px] text-blue-400 hover:text-blue-300 underline font-mono flex items-center gap-1"
+              >
+                <RotateCcw size={10} />
+                この端末のホストにリセット
+              </button>
+            </div>
+            <input
+              type="text"
+              placeholder="例: 192.168.1.15:3000 または localhost:3000"
+              value={serverHost}
+              onChange={e => setServerHost(e.target.value)}
+              className="bg-[#1f2330] border border-[#373e52] rounded-lg px-3 py-2 font-mono text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            />
+            <span className="text-[10px] text-gray-500">
+              ※同一ネットワーク（Wi-Fi）の別PCやスマホから繋ぐ場合は、親機（サーバー側）のIPv4アドレス（例: <code>192.168.x.x:3000</code>）を指定してください。
+            </span>
+          </div>
+
+          {/* Room Code Input */}
+          <div className="flex flex-col gap-1.5 border-t border-[#252a3b] pt-3">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-mono font-bold text-gray-300 flex items-center gap-1.5">
+                <KeyRound size={14} className="text-amber-400" />
+                <span>部屋コード (ルームID)</span>
+              </label>
+              <button
+                type="button"
+                onClick={handleRegenRoom}
+                className="text-[10px] text-amber-400 hover:text-amber-300 underline font-mono flex items-center gap-1"
+              >
+                <RotateCcw size={10} />
+                再生成
+              </button>
+            </div>
             <div className="flex gap-2">
               <input
                 type="text"
+                placeholder="例: ROOM-1234 または 任意の部屋名"
                 value={roomId}
                 onChange={e => setRoomId(e.target.value.toUpperCase())}
-                className="bg-[#1f2330] border border-[#373e52] rounded-lg px-3 py-2 font-mono text-sm font-bold text-white flex-1 focus:outline-none focus:border-red-500 uppercase tracking-wider"
+                className="bg-[#1f2330] border border-[#373e52] rounded-lg px-3 py-2 font-mono text-sm font-bold text-white flex-1 focus:outline-none focus:border-amber-500 uppercase tracking-wider"
               />
               <button
                 onClick={handleCopyLink}
-                className="px-3 py-2 rounded-lg bg-[#272d3d] hover:bg-[#343b4f] border border-[#414a60] text-gray-200 text-xs font-mono flex items-center gap-1.5"
+                className="px-3 py-2 rounded-lg bg-[#272d3d] hover:bg-[#343b4f] border border-[#414a60] text-gray-200 text-xs font-mono flex items-center gap-1.5 shrink-0"
                 title="相方に送るリンクをコピー"
               >
                 {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
-                <span>{copied ? 'コピー完了' : '相手の招待URL'}</span>
+                <span>{copied ? 'コピー完了' : '相方用招待URL'}</span>
               </button>
             </div>
+            <span className="text-[10px] text-gray-500">
+              同じ「部屋コード」を入力した2人が同じ爆弾に接続されます。
+            </span>
           </div>
         </div>
       )}

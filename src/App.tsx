@@ -20,10 +20,11 @@ import {
 } from 'lucide-react';
 
 export const App: React.FC = () => {
-  // Query parameters check (?room=XYZ&role=manual)
+  // Query parameters check (?room=XYZ&role=manual&server=192.168.1.10:3000)
   const urlParams = new URLSearchParams(window.location.search);
   const paramRoom = urlParams.get('room') || '';
   const paramRole = (urlParams.get('role') as PlayerRole) || 'defuser';
+  const paramServer = urlParams.get('server') || '';
 
   const [inGame, setInGame] = useState(false);
   const [playMode, setPlayMode] = useState<'solo' | 'multi'>('solo');
@@ -31,6 +32,9 @@ export const App: React.FC = () => {
   const [difficulty, setDifficulty] = useState<Difficulty>('normal');
   const [roomId, setRoomId] = useState<string>(paramRoom);
   const [myRole, setMyRole] = useState<PlayerRole>(paramRole);
+  const [serverHost, setServerHost] = useState<string>(
+    paramServer || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000')
+  );
 
   const [bomb, setBomb] = useState<BombState | null>(null);
   const [gameOverReason, setGameOverReason] = useState<string>('');
@@ -55,10 +59,22 @@ export const App: React.FC = () => {
     }
   }, [roomId, myRole]);
 
+  // Keep WebSocket connection alive with periodic ping
+  useEffect(() => {
+    const pingInterval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'PING' }));
+      }
+    }, 25000);
+    return () => clearInterval(pingInterval);
+  }, []);
+
   // Connect to WebSocket if in multiplayer mode
-  const connectWebSocket = (rId: string, role: PlayerRole) => {
+  const connectWebSocket = (rId: string, role: PlayerRole, hostAddress?: string) => {
+    const rawHost = hostAddress || serverHost || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000');
+    const cleanHost = rawHost.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const wsUrl = `${protocol}//${cleanHost}/ws`;
 
     try {
       const ws = new WebSocket(wsUrl);
@@ -72,6 +88,20 @@ export const App: React.FC = () => {
           name: role === 'defuser' ? '解除班' : '分析班'
         };
         ws.send(JSON.stringify(joinMsg));
+
+        // If I already have an active bomb, announce it to the newly opened socket
+        if (bomb && bomb.status === 'running') {
+          ws.send(JSON.stringify({
+            type: 'STATE_UPDATE',
+            room: {
+              roomId: rId,
+              bomb,
+              players: [],
+              difficulty,
+              chatMessages: []
+            }
+          }));
+        }
       };
 
       ws.onmessage = (event) => {
@@ -95,12 +125,29 @@ export const App: React.FC = () => {
     if (msg.type === 'STATE_UPDATE') {
       if (msg.room && msg.room.bomb) {
         setBomb(msg.room.bomb);
+        if (msg.room.difficulty) {
+          setDifficulty(msg.room.difficulty);
+        }
         if (msg.room.bomb.status === 'exploded') {
           soundManager.playExplosion();
-          setGameOverReason('起爆しました');
+          setGameOverReason('作戦失敗：起爆しました');
         } else if (msg.room.bomb.status === 'defused') {
           soundManager.playSuccess();
         }
+      }
+    } else if (msg.type === 'JOIN') {
+      // If someone joined and I am the defuser, send them current state
+      if (bomb && bomb.status === 'running') {
+        broadcastMessage({
+          type: 'STATE_UPDATE',
+          room: {
+            roomId,
+            bomb,
+            players: [],
+            difficulty,
+            chatMessages: []
+          }
+        });
       }
     }
   };
@@ -110,7 +157,7 @@ export const App: React.FC = () => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
     }
-    // Also send over BroadcastChannel
+    // Also send over BroadcastChannel for same-browser tabs
     if (broadcastRef.current) {
       broadcastRef.current.postMessage(msg);
     }
@@ -123,6 +170,12 @@ export const App: React.FC = () => {
       return;
     }
 
+    // In multiplayer, only defuser advances the timer; manual gets sync via STATE_UPDATE
+    if (playMode === 'multi' && myRole === 'manual') {
+      clearInterval(timerIntervalRef.current);
+      return;
+    }
+
     timerIntervalRef.current = setInterval(() => {
       setBomb((prev) => {
         if (!prev || prev.status !== 'running') return prev;
@@ -131,31 +184,36 @@ export const App: React.FC = () => {
         const isUrgent = nextTime <= 60;
         soundManager.playTick(isUrgent);
 
+        const updatedBomb: BombState = {
+          ...prev,
+          remainingTime: nextTime,
+          status: nextTime <= 0 ? 'exploded' : prev.status
+        };
+
         if (nextTime <= 0) {
           soundManager.playExplosion();
           setGameOverReason('制限時間超過：タイムアップ');
-          const explodedBomb: BombState = { ...prev, remainingTime: 0, status: 'exploded' };
-          if (playMode === 'multi') {
-            broadcastMessage({
-              type: 'STATE_UPDATE',
-              room: {
-                roomId,
-                bomb: explodedBomb,
-                players: [],
-                difficulty,
-                chatMessages: []
-              }
-            });
-          }
-          return explodedBomb;
         }
 
-        return { ...prev, remainingTime: nextTime };
+        if (playMode === 'multi') {
+          broadcastMessage({
+            type: 'STATE_UPDATE',
+            room: {
+              roomId,
+              bomb: updatedBomb,
+              players: [],
+              difficulty,
+              chatMessages: []
+            }
+          });
+        }
+
+        return updatedBomb;
       });
     }, 1000);
 
     return () => clearInterval(timerIntervalRef.current);
-  }, [bomb?.status, playMode, roomId, difficulty]);
+  }, [bomb?.status, playMode, myRole, roomId, difficulty]);
 
   // Start Solo Game
   const handleStartSolo = (diff: Difficulty) => {
@@ -171,32 +229,36 @@ export const App: React.FC = () => {
   };
 
   // Start Multiplayer Game
-  const handleJoinRoom = (rId: string, role: PlayerRole, diff: Difficulty) => {
+  const handleJoinRoom = (rId: string, role: PlayerRole, diff: Difficulty, hostAddress?: string) => {
     setDifficulty(diff);
     setPlayMode('multi');
     setRoomId(rId);
     setMyRole(role);
     setActiveView(role === 'manual' ? 'manual' : 'defuser');
 
-    connectWebSocket(rId, role);
+    connectWebSocket(rId, role, hostAddress);
 
-    const newBomb = generateBomb(diff);
-    newBomb.status = 'running';
-    newBomb.startedAt = Date.now();
-    setBomb(newBomb);
-    setInGame(true);
+    if (role === 'defuser') {
+      const newBomb = generateBomb(diff);
+      newBomb.status = 'running';
+      newBomb.startedAt = Date.now();
+      setBomb(newBomb);
+      setInGame(true);
 
-    // Broadcast new room state
-    broadcastMessage({
-      type: 'STATE_UPDATE',
-      room: {
-        roomId: rId,
-        bomb: newBomb,
-        players: [],
-        difficulty: diff,
-        chatMessages: []
-      }
-    });
+      broadcastMessage({
+        type: 'STATE_UPDATE',
+        room: {
+          roomId: rId,
+          bomb: newBomb,
+          players: [],
+          difficulty: diff,
+          chatMessages: []
+        }
+      });
+    } else {
+      // Manual player waits for or receives the existing bomb state
+      setInGame(true);
+    }
   };
 
   // Handle Strike
@@ -364,7 +426,7 @@ export const App: React.FC = () => {
         <div className="flex items-center gap-2">
           {inGame && (
             <button
-              onClick={handleRestart}
+              onClick={() => handleRestart()}
               className="p-2 rounded-lg bg-[#242938] hover:bg-[#2f3549] border border-[#373e54] text-gray-300"
               title="最初からやり直す"
             >
@@ -400,6 +462,7 @@ export const App: React.FC = () => {
             onJoinRoom={handleJoinRoom}
             initialRoomId={paramRoom}
             initialRole={paramRole}
+            initialServerHost={paramServer || (typeof window !== 'undefined' ? window.location.host : '')}
           />
         ) : (
           <div className="w-full">
@@ -417,7 +480,63 @@ export const App: React.FC = () => {
               />
             )}
 
-            {activeView === 'manual' && <ManualView />}
+            {activeView === 'manual' && (
+              <div className="flex flex-col gap-4">
+                {/* Live Tactical Monitor for Analyst in Multiplayer */}
+                {playMode === 'multi' && bomb && (
+                  <div className="max-w-5xl mx-auto w-full bg-[#151824] border-2 border-[#2f3549] rounded-xl px-4 py-2.5 flex items-center justify-between text-xs font-mono shadow-lg">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                      <span className="text-gray-300 font-bold">解除班と暗号通信中</span>
+                      <span className="text-gray-500">| ルーム: {roomId}</span>
+                    </div>
+
+                    <div className="flex items-center gap-4">
+                      {/* Timer */}
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-gray-400">残り時間:</span>
+                        <span className={`font-black text-sm px-2 py-0.5 rounded bg-black/50 border ${
+                          bomb.remainingTime <= 60 ? 'text-red-500 border-red-500 animate-pulse' : 'text-emerald-400 border-[#2f364a]'
+                        }`}>
+                          {Math.floor(bomb.remainingTime / 60)}:{(bomb.remainingTime % 60).toString().padStart(2, '0')}
+                        </span>
+                      </div>
+
+                      {/* Strikes */}
+                      <div className="flex items-center gap-1">
+                        <span className="text-gray-400">ミス:</span>
+                        <span className="font-bold text-red-500 bg-red-950/40 px-2 py-0.5 rounded border border-red-800">
+                          {'X '.repeat(bomb.strikes).trim() || 'なし'} ({bomb.strikes}/{bomb.maxStrikes})
+                        </span>
+                      </div>
+
+                      {/* Remaining Modules */}
+                      <div className="flex items-center gap-1">
+                        <span className="text-gray-400">残り:</span>
+                        <span className="text-amber-400 font-bold">
+                          {bomb.modules.filter(m => !m.isSolved).length} / {bomb.modules.length}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Waiting State if defuser hasn't connected or initialized bomb */}
+                {playMode === 'multi' && !bomb && (
+                  <div className="max-w-md mx-auto my-12 bg-[#171a25] border border-[#30374b] rounded-xl p-8 text-center space-y-4 shadow-2xl">
+                    <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent animate-spin mx-auto" />
+                    <h3 className="font-mono font-bold text-lg text-white">解除班の通信待機中…</h3>
+                    <p className="text-xs text-gray-400 leading-relaxed font-mono">
+                      ルームID: <strong className="text-amber-400">{roomId}</strong><br />
+                      解除班（相手）が爆弾を起動すると、リアルタイムに通信が同期されます。<br />
+                      下のマニュアルを先に読んで作戦の予習をしておきましょう！
+                    </p>
+                  </div>
+                )}
+
+                <ManualView />
+              </div>
+            )}
 
             {activeView === 'split' && bomb && (
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
@@ -445,7 +564,7 @@ export const App: React.FC = () => {
 
       {/* Game Over Modal */}
       {bomb && bomb.status === 'exploded' && (
-        <GameOverModal onRestart={handleRestart} reason={gameOverReason} />
+        <GameOverModal onRestart={() => handleRestart()} reason={gameOverReason} />
       )}
 
       {/* Victory Modal */}

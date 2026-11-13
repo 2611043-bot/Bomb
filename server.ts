@@ -3,7 +3,6 @@ import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,37 +10,86 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
-const rooms = new Map<string, Set<WebSocket>>();
+interface ExtWebSocket extends WebSocket {
+  isAlive?: boolean;
+}
+
+interface RoomData {
+  clients: Set<ExtWebSocket>;
+  latestState?: any;
+}
+
+const rooms = new Map<string, RoomData>();
 
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
 
-  wss.on('connection', (ws: WebSocket) => {
+  // Heartbeat to prevent idle timeouts on platforms like Render
+  const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((client) => {
+      const extWs = client as ExtWebSocket;
+      if (extWs.isAlive === false) {
+        return extWs.terminate();
+      }
+      extWs.isAlive = false;
+      extWs.ping();
+    });
+  }, 30000);
+
+  wss.on('close', () => {
+    clearInterval(heartbeatInterval);
+  });
+
+  wss.on('connection', (ws: ExtWebSocket) => {
+    ws.isAlive = true;
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
+
     let currentRoomId: string | null = null;
 
     ws.on('message', (data: string) => {
       try {
-        const message = JSON.parse(data.toString());
+        const raw = data.toString();
+        // Support simple ping strings
+        if (raw === 'ping' || raw === '{"type":"PING"}') {
+          ws.send(JSON.stringify({ type: 'PONG' }));
+          return;
+        }
+
+        const message = JSON.parse(raw);
 
         if (message.type === 'JOIN') {
           currentRoomId = message.roomId;
           if (!rooms.has(message.roomId)) {
-            rooms.set(message.roomId, new Set());
+            rooms.set(message.roomId, { clients: new Set() });
           }
-          rooms.get(message.roomId)!.add(ws);
+          const room = rooms.get(message.roomId)!;
+          room.clients.add(ws);
 
-          // Broadcast to others in room
-          for (const client of rooms.get(message.roomId)!) {
+          // If the room already has an active bomb state, send it immediately to the new player
+          if (room.latestState) {
+            ws.send(JSON.stringify({
+              type: 'STATE_UPDATE',
+              room: room.latestState
+            }));
+          }
+
+          // Broadcast JOIN to others in the room
+          for (const client of room.clients) {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify(message));
             }
           }
-        } else if (message.type === 'STATE_UPDATE' || message.type === 'INTERACT') {
+        } else if (message.type === 'STATE_UPDATE') {
           const rId = message.room?.roomId || currentRoomId;
           if (rId && rooms.has(rId)) {
-            for (const client of rooms.get(rId)!) {
+            const room = rooms.get(rId)!;
+            room.latestState = message.room;
+
+            for (const client of room.clients) {
               if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(message));
               }
@@ -49,8 +97,10 @@ async function startServer() {
           }
         } else {
           // Relay any other messages to room members
-          if (currentRoomId && rooms.has(currentRoomId)) {
-            for (const client of rooms.get(currentRoomId)!) {
+          const rId = message.roomId || currentRoomId;
+          if (rId && rooms.has(rId)) {
+            const room = rooms.get(rId)!;
+            for (const client of room.clients) {
               if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(message));
               }
@@ -64,16 +114,23 @@ async function startServer() {
 
     ws.on('close', () => {
       if (currentRoomId && rooms.has(currentRoomId)) {
-        rooms.get(currentRoomId)!.delete(ws);
-        if (rooms.get(currentRoomId)!.size === 0) {
+        const room = rooms.get(currentRoomId)!;
+        room.clients.delete(ws);
+        if (room.clients.size === 0) {
           rooms.delete(currentRoomId);
         }
       }
     });
   });
 
+  // Health check endpoint for monitoring / hosting platforms
+  app.get('/healthz', (_req, res) => {
+    res.status(200).send('OK');
+  });
+
   // Vite middleware in dev or static files in prod
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -87,7 +144,7 @@ async function startServer() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`> Bomb Defusal Server running at http://0.0.0.0:${PORT}`);
+    console.log(`> Bomb Defusal Server running at http://0.0.0.0:${PORT} [${isProd ? 'PRODUCTION' : 'DEVELOPMENT'}]`);
   });
 }
 
